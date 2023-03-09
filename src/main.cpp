@@ -1,17 +1,24 @@
 #include <Arduino.h>
 #include <U8g2lib.h>
 #include <vector>
+#include <math.h>
+#include <HardwareTimer.h>
+#include <STM32FreeRTOS.h>
 
 // Constants
 const uint32_t interval = 100; // Display update interval
 
 // My constants
+SemaphoreHandle_t keyArrayMutex;
 uint8_t keyArray[7];
 std::vector<const char *> keysPressed;
+bool firstTime = true;
 
 // Step sizes for the notes from C to B
 const int32_t stepSizes[] = {51076057, 54113197, 57330935, 60740010, 64351799, 68178356, 72232452, 76527617, 81078186, 85899346, 91007186, 96418756};
 volatile int32_t currentStepSize;
+
+volatile int8_t rotationValue = 6;
 
 // Pin definitions
 // Row select and enable
@@ -82,9 +89,215 @@ uint8_t readCols()
   return c0 + (c1 << 1) + (c2 << 2) + (c3 << 3);
 }
 
+const char *appendKey()
+{
+  const char *findKeyArray[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+  const char *neutralFace = "- _ -";
+  const char *neutralValue = "";
+
+  for (int k = 0; k < 12; k++)
+  {
+    if (!((0b1 << k) & (keyArray[0] + (keyArray[1] << 4) + (keyArray[2] << 8))))
+    {
+      neutralFace = "^ 0 ^";
+      neutralValue = findKeyArray[k];
+      break;
+    }
+    else
+    {
+      continue;
+    }
+  }
+
+  // u8g2.drawStr(2, 30, neutralFace);
+  // u8g2.drawStr(42, 30, neutralValue);
+
+  return neutralValue;
+}
+
+const char *whichKey()
+{
+  const char *findKeyArray[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+  const char *neutralValue = "";
+
+  for (int k = 0; k < 12; k++)
+  {
+    if (!((0b1 << k) & (keyArray[0] + (keyArray[1] << 4) + (keyArray[2] << 8))))
+    {
+      neutralValue = findKeyArray[k];
+      break;
+    }
+    else
+    {
+      continue;
+    }
+  }
+
+  return neutralValue;
+}
+
+const char *whichFace()
+{
+  const char *findKeyArray[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
+
+  const char *neutralFace = "- _ -";
+
+  for (int k = 0; k < 12; k++)
+  {
+    if (!((0b1 << k) & (keyArray[0] + (keyArray[1] << 4) + (keyArray[2] << 8))))
+    {
+      neutralFace = "^ 0 ^";
+      break;
+    }
+    else
+    {
+      continue;
+    }
+  }
+
+  // u8g2.drawStr(2, 30, neutralFace);
+  // u8g2.drawStr(42, 30, neutralValue);
+
+  return neutralFace;
+}
+
+void checkKeyState(int32_t localCurrentStepSize)
+{
+  // stepSizes
+  const char *neutralValue = "";
+
+  for (int k = 0; k < 12; k++)
+  {
+    if (!((0b1 << k) & (keyArray[0] + (keyArray[1] << 4) + (keyArray[2] << 8))))
+    {
+      localCurrentStepSize = stepSizes[k];
+      break;
+    }
+    else
+    {
+      continue;
+    }
+  }
+
+  // u8g2.drawStr(2, 30, "CS:" + char(localCurrentStepSize));
+  // u8g2.drawStr(42, 30, neutralValue);
+
+  __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
+
+  // return currentStepSize;
+}
+
+void knob3_turn(bool firstTime)
+{
+  static uint8_t previousA;
+  static uint8_t previousB;
+  static uint8_t previousTransistion;
+
+  uint8_t currentA;
+  uint8_t currentB;
+  uint8_t currentTransistion;
+
+  if (firstTime == true)
+  {
+    setRow(3);
+    delayMicroseconds(3);
+    previousA = readCols() & 0b00000001;
+    previousB = readCols() & 0b00000010;
+  }
+  else
+  {
+    setRow(3);
+    delayMicroseconds(3);
+    currentA = readCols() & 0b00000001;
+    currentB = readCols() & 0b00000010;
+
+    uint8_t combinedPrev = previousA + (previousB << 1);
+    uint8_t combinedCurr = currentA + (currentB << 1);
+
+    if (((combinedPrev == 00) && (combinedCurr == 01)) || ((combinedPrev == 11) && (combinedCurr == 10)))
+    {
+      currentTransistion = 1;
+    }
+    else if (((combinedPrev == 01) && (combinedCurr == 00)) || ((combinedPrev == 10) && (combinedCurr == 11)))
+    {
+      currentTransistion = -1;
+    }
+  }
+
+  previousA = currentA;
+  previousB = currentB;
+  previousTransistion = currentTransistion;
+
+  __atomic_store_n(&rotationValue, rotationValue + currentTransistion, __ATOMIC_RELAXED);
+}
+
+void scanKeysTask(void *pvParameters)
+{
+  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;
+
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  while (1)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+    uint32_t tempCurrentStepSize = 0;
+
+    xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
+
+    for (int j = 0; j < 4; j++)
+    {
+      setRow(j);
+      delayMicroseconds(3);
+      uint8_t keys = readCols();
+      keyArray[j] = keys;
+      // u8g2.print(keys, HEX);
+    }
+
+    xSemaphoreGive(keyArrayMutex);
+
+    const char *keyValueState = appendKey();
+
+    knob3_turn(firstTime);
+
+    if (firstTime == true)
+    {
+      firstTime == false;
+    }
+
+    checkKeyState(tempCurrentStepSize);
+  }
+}
+
+void displayUpdateTask(void *pvParameters)
+{
+  const TickType_t xFrequency = 100 / portTICK_PERIOD_MS;
+
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+
+  static uint32_t next = millis();
+  static uint32_t count = 0;
+
+  while (1)
+  {
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+    u8g2.clearBuffer();                  // clear the internal memory
+    u8g2.setFont(u8g2_font_ncenB08_tr);  // choose a suitable font
+    u8g2.drawStr(2, 10, "Hello World!"); // write something to the internal memory
+    u8g2.setCursor(2, 20);
+    u8g2.print(rotationValue, DEC);
+
+    u8g2.drawStr(2, 30, whichFace());
+    u8g2.drawStr(42, 30, whichKey());
+
+    u8g2.sendBuffer(); // transfer internal memory to the display
+  }
+}
+
 void sampleISR()
 {
-
   static int32_t phaseAcc = 0;
   phaseAcc += currentStepSize;
   int32_t Vout = phaseAcc >> 24;
@@ -93,6 +306,17 @@ void sampleISR()
 
 void setup()
 {
+
+  TIM_TypeDef *Instance = TIM1;
+  HardwareTimer *sampleTimer = new HardwareTimer(Instance);
+
+  noInterrupts();
+
+  sampleTimer->setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer->attachInterrupt(sampleISR);
+  sampleTimer->resume();
+
+  interrupts();
   // put your setup code here, to run once:
 
   // Set pin directions
@@ -123,111 +347,48 @@ void setup()
   Serial.begin(9600);
   Serial.println("Hello World");
 
-  TIM_TypeDef *Instance = TIM1;
-  HardwareTimer *sampleTimer = new HardwareTimer(Instance);
+  TaskHandle_t scanKeysHandle = NULL;
+  xTaskCreate(
+      scanKeysTask,     /* Function that implements the task */
+      "scanKeys",       /* Text name for the task */
+      64,               /* Stack size in words, not bytes */
+      NULL,             /* Parameter passed into the task */
+      2,                /* Task priority */
+      &scanKeysHandle); /* Pointer to store the task handle */
 
-  sampleTimer->setOverflow(22000, HERTZ_FORMAT);
-  sampleTimer->attachInterrupt(sampleISR);
-  sampleTimer->resume();
+  TaskHandle_t displayUpdateHandle = NULL;
+  xTaskCreate(
+      displayUpdateTask,     /* Function that implements the task */
+      "displayUpdate",       /* Text name for the task */
+      256,                   /* Stack size in words, not bytes */
+      NULL,                  /* Parameter passed into the task */
+      1,                     /* Task priority */
+      &displayUpdateHandle); /* Pointer to store the task handle */
+
+  keyArrayMutex = xSemaphoreCreateMutex();
+
+  vTaskStartScheduler();
 }
-
-const char *appendKey()
-{
-  const char *findKeyArray[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
-
-  const char *neutralFace = "- _ -";
-  const char *neutralValue = "";
-
-  for (int k = 0; k < 12; k++)
-  {
-    if (!((0b1 << k) & (keyArray[0] + (keyArray[1] << 4) + (keyArray[2] << 8))))
-    {
-      neutralFace = "^ 0 ^";
-      neutralValue = findKeyArray[k];
-      break;
-    }
-    else
-    {
-      continue;
-    }
-  }
-
-  u8g2.drawStr(2, 30, neutralFace);
-  // u8g2.drawStr(42, 30, neutralValue);
-
-  return neutralValue;
-}
-
-void checkKeyState(int32_t localCurrentStepSize)
-{
-  // stepSizes
-  const char *neutralValue = "";
-
-  for (int k = 0; k < 12; k++)
-  {
-    if (!((0b1 << k) & (keyArray[0] + (keyArray[1] << 4) + (keyArray[2] << 8))))
-    {
-      localCurrentStepSize = stepSizes[k];
-      break;
-    }
-    else
-    {
-      continue;
-    }
-  }
-
-  u8g2.drawStr(2, 30, "CS:" + char(localCurrentStepSize));
-  // u8g2.drawStr(42, 30, neutralValue);
-
-  __atomic_store_n(&currentStepSize, localCurrentStepSize, __ATOMIC_RELAXED);
-
-  // return currentStepSize;
-}
-
-// void scanKeysTask(void *pvParameters)
-// {
-//   …
-// }
 
 void loop()
 {
   // put your main code here, to run repeatedly:
-  static uint32_t next = millis();
-  static uint32_t count = 0;
-  uint32_t tempCurrentStepSize = 0;
 
-  if (millis() > next)
-  {
-    next += interval;
+  // uint32_t tempCurrentStepSize = 0;
 
-    // Update display
-    u8g2.clearBuffer();                  // clear the internal memory
-    u8g2.setFont(u8g2_font_ncenB08_tr);  // choose a suitable font
-    u8g2.drawStr(2, 10, "Hello World!"); // write something to the internal memory
-    u8g2.setCursor(2, 20);
+  // if (millis() > next)
+  // {
+  //   next += interval;
 
-    for (int j = 0; j < 3; j++)
-    {
-      setRow(j);
-      delayMicroseconds(3);
-      uint8_t keys = readCols();
-      keyArray[j] = keys;
-      u8g2.print(keys, HEX);
-    }
+  //   // Update display
+  //   u8g2.clearBuffer();                  // clear the internal memory
+  //   u8g2.setFont(u8g2_font_ncenB08_tr);  // choose a suitable font
+  //   u8g2.drawStr(2, 10, "Hello World!"); // write something to the internal memory
+  //   u8g2.setCursor(2, 20);
 
-    const char *keyValueState = appendKey();
+  //   u8g2.sendBuffer(); // transfer internal memory to the display
 
-    // u8g2.drawStr(42, 30, keyValueState);
-    u8g2.setCursor(42, 30);
-    // u8g2.print(keyArray[0], HEX);
-    // uint32_t tempCurrentStepSize = currentStepSize;
-    // currentStepSize = checkKeyState(tempCurrentStepSize);
-    // __atomic_store_n(&currentStepSize, checkKeyState(tempCurrentStepSize), __ATOMIC_RELAXED);
-    checkKeyState(tempCurrentStepSize);
-
-    u8g2.sendBuffer(); // transfer internal memory to the display
-
-    // Toggle LED
-    digitalToggle(LED_BUILTIN);
-  }
+  //   // Toggle LED
+  //   digitalToggle(LED_BUILTIN);
+  // }
 }
